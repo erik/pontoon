@@ -1,4 +1,3 @@
-# FIXME: Maybe this is more accurately a node?
 defmodule Pontoon.Member do
   defstruct [:address, :port, :last_seen, :name]
 end
@@ -7,7 +6,7 @@ defmodule Pontoon.Membership do
   require Logger
   use Agent
 
-  @max_member_age_ms 20 * 60 * 1000
+  @max_member_age_ms Application.get_env(:pontoon, :max_member_age_ms)
   @prune_interval_ms 10 * 1000
 
 

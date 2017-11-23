@@ -2,8 +2,8 @@ defmodule Pontoon.Multicast do
   require Logger
   use GenServer
 
-  @announce_interval_ms 3 * 1000
-  @multicast_address {224, 0, 0, 251}
+  @announce_interval_ms Application.get_env(:pontoon, :announce_interval_ms)
+  @multicast_address    Application.get_env(:pontoon, :multicast_group_address)
 
   defmodule Message do
     @derive [Poison.Encoder]
