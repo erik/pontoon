@@ -5,6 +5,10 @@
 Toy implementation of the [Raft](http://raft.github.io/) consensus
 algorithm, built using Elixir / OTP.
 
+In an effort to keep the scope manageable, membership is discovered simply
+through an IGMP multicast group, though theoretically something like SWIM or
+`epmd` could be substituted in.
+
 ## Setup
 
 ``` bash
