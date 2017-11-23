@@ -15,7 +15,7 @@ defmodule Pontoon.Mixfile do
   def application do
     [
       extra_applications: [:logger],
-      mod: {Pontoon.Application, []}
+      mod: {Pontoon, []}
     ]
   end
 
