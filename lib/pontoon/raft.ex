@@ -5,7 +5,8 @@ defmodule Pontoon.Raft do
   alias Pontoon.RPC, as: RPC
 
   defmodule State do
-    @leader_election_interval_ms 1000
+    @leader_election_interval_ms 750
+    @leader_election_fuzz_factor_ms 250
     @append_entries_interval_ms 500
 
     defstruct role: :follower, leader: nil, term: 0, log: [], commit_log: [],
@@ -16,7 +17,10 @@ defmodule Pontoon.Raft do
     end
 
     def reset_election_timer(state, pid) do
-      timer = Process.send_after(pid, :leader_election, @leader_election_interval_ms)
+      # We add in some noise to the timer duration to make sure the elections
+      # don't always play out the same.
+      duration = :rand.uniform(@leader_election_fuzz_factor_ms) + @leader_election_interval_ms
+      timer = Process.send_after(pid, :leader_election, duration)
 
       # Clear any existing timer
       if state.election_timer do
@@ -30,11 +34,15 @@ defmodule Pontoon.Raft do
       Process.send_after(pid, {:append_entries, []}, @append_entries_interval_ms)
     end
 
-    def get_last_log_term(state) do
-      case List.last(state.log) do
-        nil -> 0
-        tl -> tl.term
+    def get_log_term(state, index) do
+      case Enum.at(state.log, index) do
+        nil -> -1
+        entry -> entry.term
       end
+    end
+
+    def get_last_log_term(state) do
+      get_log_term(state, length(state.log) - 1)
     end
 
     def maybe_step_down(state, member, remote_term) do
@@ -51,20 +59,24 @@ defmodule Pontoon.Raft do
       state = maybe_step_down(state, member, rpc.term)
       |> State.reset_election_timer(self())
 
-      {accept_append, state} =
+      {accept_append, state, last_idx} =
         cond do
           rpc.term < state.term ->
-            {false, state}
+            {false, state, -1}
 
           rpc.prev_log_idx >= length(state.log) ->
-            {false, state}
+            {false, state, length(state.log) - 1}
 
-          state.log[rpc.prev_log_idx].term != rpc.prev_log_term ->
+          # If this is the first entry we receive, everything should check out
+          rpc.prev_log_idx == -1 ->
+            {true, %{state | log: rpc.entries, commit_idx: rpc.leader_commit}, length(rpc.entries) - 1}
+
+          State.get_log_term(state, rpc.prev_log_idx) != rpc.prev_log_term ->
             # Follow the leader, delete mismatched log items.
             # FIXME: should handle earlier inconsistencies as well.
             log = state.log |> Enum.take(rpc.prev_log_idx - 1)
 
-            {false, %{state | log: log}}
+            {false, %{state | log: log}, length(log) - 1}
 
           # Success! append entries
           true ->
@@ -77,10 +89,14 @@ defmodule Pontoon.Raft do
                 state.commit_idx
               end
 
-            {true, %{state | log: log, commit_idx: commit}}
+            {true, %{state | log: log, commit_idx: commit}, length(log) - 1}
         end
 
-      reply = %RPC.ReplyAppendEntries{term: state.term, success: accept_append}
+      reply = %RPC.ReplyAppendEntries{
+        term: state.term,
+        success: accept_append,
+        match_idx: last_idx
+      }
       {reply, state}
     end
 
@@ -99,7 +115,7 @@ defmodule Pontoon.Raft do
             Logger.info("rejecting #{member.name} because already voted")
             false
 
-          # FIXME: idk if commit_idx is correct
+          # FIXME: need to implement commit index correctly
           rpc.last_log_idx < state.commit_idx ->
             Logger.info("rejecting #{member.name} for last_log_idx")
             false
@@ -157,18 +173,55 @@ defmodule Pontoon.Raft do
       {nil, state}
     end
 
-    def handle_rpc(state, _member, %RPC.ReplyAppendEntries{} = _rpc) do
-      # Logger.info("Got append entries reply: #{inspect rpc}")
-      state = State.reset_election_timer(state, self())
+    def handle_rpc(state, _member, %RPC.RequestAppendEntry{} = rpc) do
+      if rpc.term != state.term do
+        Logger.warn("requestAppendEntry called with outdated term, dropping")
+        else
+          Logger.info("received append entries request, forwarding to self")
+          GenServer.cast(Pontoon.Raft, {:request_append_entry, rpc.value})
+          {nil, state}
+      end
+    end
 
-      # TODO: write me
+    def handle_rpc(state, member, %RPC.ReplyAppendEntries{} = rpc) do
+      state = maybe_step_down(state, member, rpc.term)
+      |> State.reset_election_timer(self())
 
-      {nil, state}
+      case state.role do
+        :leader ->
+          leader_state =
+          if rpc.success do
+            match_idx = state.leader_state.match_idx
+            |> Map.update(member.name, 0, fn last_match_idx ->
+              max(last_match_idx, rpc.match_idx)
+            end)
+
+            next_idx = state.leader_state.next_idx
+            |> Map.put(member.name, rpc.match_idx + 1)
+
+            %{state.leader_state | match_idx: match_idx, next_idx: next_idx}
+          else
+            Logger.info("failed to append entries, rolling back next_idx: #{inspect rpc}")
+
+            next_idx = state.leader_state.next_idx
+            |> Map.update(member.name, 0, fn idx ->
+              max(0, idx - 1)
+            end)
+
+            %{state.leader_state | next_idx: next_idx}
+          end
+
+          {nil, %{state | leader_state: leader_state}}
+
+        _ ->
+          Logger.warn("received replyAppendEntries while not leading, dropping.")
+          {nil, state}
+      end
     end
   end
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts)
+    GenServer.start_link(__MODULE__, opts, [name: __MODULE__])
   end
 
   def init(opts) do
@@ -186,6 +239,14 @@ defmodule Pontoon.Raft do
     {:ok, state}
   end
 
+  def append_log(log_entry) do
+    GenServer.cast(__MODULE__, {:request_append_entry, log_entry})
+  end
+
+  def get_log() do
+    GenServer.call(__MODULE__, :get_log)
+  end
+
   def send_broadcast(message) do
     RPC.encode(message) |> Pontoon.Membership.send_broadcast
   end
@@ -193,6 +254,30 @@ defmodule Pontoon.Raft do
   def send_to(%Pontoon.Member{} = member, message) do
     encoded = RPC.encode(message)
     Pontoon.Membership.send_to(member, encoded)
+  end
+
+  def handle_call(:get_log, _from, state) do
+    {:reply, state.log, state}
+  end
+
+  def handle_cast({:request_append_entry, log_entry}, state) do
+    entry = %RPC.RequestAppendEntry{value: log_entry, term: state.term}
+
+    case state.role do
+      :leader ->
+        Logger.info("I am the leader, appending: #{inspect entry}")
+        handle_info({:append_entries, [entry]}, state)
+
+      :follower ->
+        Logger.info("request_append_entry called, forwarding to leader #{inspect state.leader}")
+
+        encoded = RPC.encode(entry)
+        Pontoon.Membership.send_to(state.leader, encoded)
+        {:noreply, state}
+
+      :candidate ->
+        {:error, "no leader known, can't commit log entry right now"}
+    end
   end
 
   def handle_info({:udp, _socket, _ip, _port, data}, state) do
@@ -211,21 +296,32 @@ defmodule Pontoon.Raft do
   end
 
   def handle_info({:append_entries, entries}, state) do
-    # FIXME: no reason this is attached to State
     State.schedule_append_entries(self())
 
     case state.role do
       :leader ->
-        send_broadcast(%RPC.AppendEntries{
-              term: state.term,
-              leader: Pontoon.Membership.get_own_name(),
-              prev_log_idx: state.commit_idx,
-              prev_log_term: State.get_last_log_term(state),
-              leader_commit: nil,
-              entries: entries,
-        })
+        log = state.log ++ entries
 
-        {:noreply, state}
+        Pontoon.Membership.list()
+        |> Enum.map(fn {name, member} ->
+          prev_log_idx = state.leader_state.match_idx |> Map.get(name, -1)
+          next_idx = state.leader_state.next_idx |> Map.get(name, 0)
+          prev_term = State.get_log_term(state, prev_log_idx)
+
+          entries = log |> Enum.slice(next_idx..-1)
+
+          {member, %RPC.AppendEntries{
+            term: state.term,
+            leader: Pontoon.Membership.get_own_name(),
+            prev_log_idx: next_idx - 1,
+            prev_log_term: prev_term,
+            leader_commit: state.commit_idx,
+            entries: entries
+          }}
+        end)
+        |> Enum.map(fn {member, message} -> send_to(member, message) end)
+
+        {:noreply, %{state | log: log}}
 
       _else ->
         {:noreply, state}
@@ -261,8 +357,8 @@ defmodule Pontoon.Raft do
                     term: state.term + 1,
                     leader_state: %State.Leader{
                       votes: MapSet.new,
-                      match_idx: members |> Enum.map(&{&1, 0}) |> Enum.into(%{}),
-                      next_idx: members |> Enum.map(&{&1, 1}) |> Enum.into(%{})
+                      match_idx: members |> Enum.map(&{&1, -1}) |> Enum.into(%{}),
+                      next_idx: members |> Enum.map(&{&1, 0}) |> Enum.into(%{})
                     },
                    }
 

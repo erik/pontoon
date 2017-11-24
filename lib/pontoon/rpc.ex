@@ -5,9 +5,19 @@ defmodule Pontoon.RPC do
   @derive [Poison.Encoder]
   defstruct [:type, :name, :data]
 
+  defmodule Entry do
+    @derive [Poison.Encoder]
+    defstruct [:term, :value]
+  end
+
   defmodule RequestVote do
     @derive [Poison.Encoder]
     defstruct [:term, :candidate, :last_log_idx, :last_log_term]
+  end
+
+  defmodule RequestAppendEntry do
+    @derive [Poison.Encoder]
+    defstruct [:term, :value]
   end
 
   defmodule AppendEntries do
@@ -22,7 +32,7 @@ defmodule Pontoon.RPC do
 
   defmodule ReplyAppendEntries do
     @derive [Poison.Encoder]
-    defstruct [:term, :success]
+    defstruct [:term, :success, :match_idx]
   end
 
   # FIXME: This feels redundant and gross
@@ -33,9 +43,11 @@ defmodule Pontoon.RPC do
     msg =
       case rpc.type do
         "AppendEntries" ->
-          Poison.decode!(rpc.data, as: %AppendEntries{})
+          Poison.decode!(rpc.data, as: %AppendEntries{entries: [%Entry{}]})
         "ReplyAppendEntries" ->
           Poison.decode!(rpc.data, as: %ReplyAppendEntries{})
+        "RequestAppendEntry" ->
+          Poison.decode!(rpc.data, as: %RequestAppendEntry{})
         "RequestVote" ->
           Poison.decode!(rpc.data, as: %RequestVote{})
         "ReplyRequestVote" ->
@@ -59,7 +71,6 @@ defmodule Pontoon.RPC do
 
   def encode(type, data) do
     name = Pontoon.Membership.get_own_name()
-
     Poison.encode!(%__MODULE__{type: type, data: data, name: name})
   end
 end
